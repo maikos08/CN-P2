@@ -9,29 +9,34 @@ STREAM_NAME = 'cars-stream'
 REGION = 'us-east-1'
 INPUT_FILE = 'cars_data.json'
 
-# *** CONFIGURACIÓN IMPORTANTE ***
-MAX_RECORDS = None
-BATCH_SIZE = 500
-DELAY_BETWEEN_BATCHES = 1
+# Configuración del delay entre registros
+DELAY_BETWEEN_RECORDS = 0.01
 
 kinesis = boto3.client('kinesis', region_name=REGION)
 
-def load_data(file_path, max_records=None):
+def load_data(file_path):
     """Carga el archivo JSON con los datos de coches"""
     with open(file_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+        return json.load(f)
 
-    if max_records:
-        logger.warning(f"Limitando a {max_records} registros de {len(data)} totales")
-        return data[:max_records]
+def run_producer():
+    """Envía los registros de coches al stream de Kinesis """
+    data = load_data(INPUT_FILE)
+    total_records = len(data)
+    records_sent = 0
 
-    return data
+    logger.info(f"{'='*60}")
+    logger.info(f"Iniciando transmisión al stream: {STREAM_NAME}")
+    logger.info(f"Total de coches a enviar: {total_records:,}")
+    logger.info(f"Velocidad: ~{1/DELAY_BETWEEN_RECORDS:.0f} registros/segundo")
+    logger.info(f"Tiempo estimado: ~{total_records * DELAY_BETWEEN_RECORDS:.0f} segundos")
+    logger.info(f"{'='*60}")
 
-def send_batch(records_batch):
-    """Envía un lote de registros usando put_records (más eficiente)"""
-    entries = []
+    start_time = time.time()
 
-    for car in records_batch:
+    # Enviar registro por registro al stream
+    for i, car in enumerate(data, start=1):
+        
         payload = {
             'id': car['id'],
             'brand': car['brand'],
@@ -48,69 +53,31 @@ def send_batch(records_batch):
             'timestamp_ingestion': datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
 
-        entries.append({
-            'Data': json.dumps(payload),
-            'PartitionKey': car['brand']
-        })
-
-    # Enviar lote completo
-    response = kinesis.put_records(
-        StreamName=STREAM_NAME,
-        Records=entries
-    )
-
-    # Verificar si hubo fallos
-    failed_count = response['FailedRecordCount']
-    if failed_count > 0:
-        logger.warning(f"{failed_count} registros fallaron en este lote")
-
-    return len(entries) - failed_count
-
-def run_producer():
-    """Envía los registros de coches al stream de Kinesis usando batches"""
-    data = load_data(INPUT_FILE, max_records=MAX_RECORDS)
-    total_records = len(data)
-    records_sent = 0
-
-    logger.info(f"{'='*60}")
-    logger.info(f"Iniciando transmisión al stream: {STREAM_NAME}")
-    logger.info(f"Total de coches a enviar: {total_records:,}")
-    logger.info(f"Tamaño de lote: {BATCH_SIZE}")
-    logger.info(f"Velocidad estimada: ~{BATCH_SIZE / DELAY_BETWEEN_BATCHES:.0f} registros/segundo")
-
-    # Calcular tiempo estimado
-    total_batches = (total_records + BATCH_SIZE - 1) // BATCH_SIZE
-    estimated_time = total_batches * DELAY_BETWEEN_BATCHES
-    logger.info(f"Tiempo estimado: ~{estimated_time:.0f} segundos ({estimated_time/60:.1f} minutos)")
-    logger.info(f"{'='*60}")
-
-    start_time = time.time()
-
-    # Procesar en lotes
-    for i in range(0, total_records, BATCH_SIZE):
-        batch = data[i:i + BATCH_SIZE]
-        batch_num = (i // BATCH_SIZE) + 1
-
         try:
-            sent = send_batch(batch)
-            records_sent += sent
-
-            # Calcular progreso
-            progress_pct = (records_sent / total_records) * 100
-            elapsed = time.time() - start_time
-
-            logger.info(
-                f"Lote {batch_num}/{total_batches} | "
-                f"Enviados: {records_sent:,}/{total_records:,} ({progress_pct:.1f}%) | "
-                f"Tiempo: {elapsed:.1f}s"
+            # Enviar a Kinesis
+            response = kinesis.put_record(
+                StreamName=STREAM_NAME,
+                Data=json.dumps(payload),
+                PartitionKey=car['brand']  # Usa marca como partition key
             )
 
-            # Pequeña pausa entre lotes para no saturar
-            if i + BATCH_SIZE < total_records:
-                time.sleep(DELAY_BETWEEN_BATCHES)
+            records_sent += 1
+
+            # Log cada 100 registros o al final
+            if i % 100 == 0 or i == total_records:
+                progress_pct = (i / total_records) * 100
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"Enviado: {i:,}/{total_records:,} ({progress_pct:.1f}%) | "
+                    f"Tiempo: {elapsed:.1f}s | "
+                    f"Shard: {response['ShardId']}"
+                )
+
+            # Pequeña pausa para simular streaming
+            time.sleep(DELAY_BETWEEN_RECORDS)
 
         except Exception as e:
-            logger.error(f"❌ Error en lote {batch_num}: {str(e)}")
+            logger.error(f"Error enviando registro {i}: {str(e)}")
             continue
 
     elapsed_total = time.time() - start_time
@@ -119,7 +86,7 @@ def run_producer():
     logger.info(f"✓ Transmisión completada")
     logger.info(f"✓ Total registros enviados: {records_sent:,}/{total_records:,}")
     logger.info(f"✓ Tiempo total: {elapsed_total:.1f}s ({elapsed_total/60:.1f} minutos)")
-    logger.info(f"✓ Velocidad real: {records_sent/elapsed_total:.0f} registros/segundo")
+    logger.info(f"✓ Velocidad real: {records_sent/elapsed_total:.1f} registros/segundo")
     logger.info(f"{'='*60}")
 
 if __name__ == '__main__':
@@ -127,7 +94,6 @@ if __name__ == '__main__':
         run_producer()
     except FileNotFoundError:
         logger.error(f"No se encuentra el archivo {INPUT_FILE}")
-        logger.error("Asegúrate de haber ejecutado el script de conversión CSV→JSON primero")
     except Exception as e:
         logger.error(f"Error inesperado: {str(e)}")
         import traceback
